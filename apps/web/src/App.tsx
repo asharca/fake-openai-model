@@ -66,7 +66,7 @@ export const App = () => {
   const [connected, setConnected] = useState(false);
 
   useEffect(() => {
-    const eventSource = new EventSource("http://localhost:3000/events/prompts");
+    const eventSource = new EventSource("/events/prompts");
 
     eventSource.onopen = () => setConnected(true);
     eventSource.onerror = () => setConnected(false);
