@@ -1,3 +1,7 @@
+import { mkdirSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+
 export type ProxyMode = "capture_only" | "forward";
 export type ApiType = "chat_completions" | "responses";
 
@@ -48,7 +52,6 @@ export type DashboardState = {
   models: ModelRecord[];
 };
 
-const exchanges: ExchangeRecord[] = [];
 const listeners = new Set<(latest: ExchangeRecord | null, state: DashboardState) => void>();
 
 const defaultModels: ModelRecord[] = [
@@ -59,8 +62,6 @@ const defaultModels: ModelRecord[] = [
     owned_by: "fake-model"
   }
 ];
-
-let modelCatalog: ModelRecord[] = [...defaultModels];
 
 const pathFromApiType = (apiType: ApiType) => (apiType === "responses" ? "/v1/responses" : "/v1/chat/completions");
 const apiTypeFromPath = (path: string): ApiType => (path.includes("/responses") ? "responses" : "chat_completions");
@@ -76,6 +77,112 @@ const proxyConfig: ProxyConfig = {
   apiKey: process.env.UPSTREAM_API_KEY ?? "",
   modelOverride: process.env.UPSTREAM_MODEL ?? ""
 };
+
+const sqlitePath = resolve(process.cwd(), process.env.SQLITE_PATH ?? "data/fake-model.db");
+mkdirSync(dirname(sqlitePath), { recursive: true });
+const db = new DatabaseSync(sqlitePath);
+
+db.exec(`
+PRAGMA journal_mode = WAL;
+CREATE TABLE IF NOT EXISTS proxy_config (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  mode TEXT NOT NULL,
+  api_type TEXT NOT NULL,
+  base_url TEXT NOT NULL,
+  path TEXT NOT NULL,
+  api_key TEXT NOT NULL,
+  model_override TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS models (
+  id TEXT PRIMARY KEY,
+  object TEXT NOT NULL,
+  created INTEGER NOT NULL,
+  owned_by TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS exchanges (
+  id TEXT PRIMARY KEY,
+  mode TEXT NOT NULL,
+  model TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  prompt_tokens INTEGER NOT NULL,
+  request_body TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  completed_at TEXT,
+  response_status TEXT NOT NULL,
+  response_body TEXT,
+  error_message TEXT,
+  upstream_url TEXT,
+  upstream_status_code INTEGER,
+  duration_ms INTEGER
+);
+`);
+
+const hasConfig = db.prepare("SELECT 1 AS ok FROM proxy_config WHERE id = 1").get() as { ok: number } | undefined;
+if (!hasConfig) {
+  db.prepare(
+    `INSERT INTO proxy_config (id, mode, api_type, base_url, path, api_key, model_override)
+     VALUES (1, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    proxyConfig.mode,
+    proxyConfig.apiType,
+    proxyConfig.baseUrl,
+    proxyConfig.path,
+    proxyConfig.apiKey,
+    proxyConfig.modelOverride
+  );
+}
+
+const existingModels = db.prepare("SELECT COUNT(*) AS count FROM models").get() as { count: number };
+if (!existingModels.count) {
+  const insertModel = db.prepare("INSERT INTO models (id, object, created, owned_by) VALUES (?, ?, ?, ?)");
+  for (const item of defaultModels) {
+    insertModel.run(item.id, item.object, item.created, item.owned_by);
+  }
+}
+
+const parseJson = (value: string | null | undefined): unknown => {
+  if (!value) {
+    return undefined;
+  }
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    return undefined;
+  }
+};
+
+const mapExchangeRow = (row: Record<string, unknown>): ExchangeRecord => ({
+  id: String(row.id),
+  mode: row.mode === "forward" ? "forward" : "capture_only",
+  model: String(row.model),
+  prompt: String(row.prompt),
+  promptTokens: Number(row.prompt_tokens) || 0,
+  requestBody: parseJson(typeof row.request_body === "string" ? row.request_body : undefined),
+  createdAt: String(row.created_at),
+  completedAt: typeof row.completed_at === "string" ? row.completed_at : undefined,
+  responseStatus: row.response_status === "error" ? "error" : row.response_status === "success" ? "success" : "pending",
+  responseBody: parseJson(typeof row.response_body === "string" ? row.response_body : undefined),
+  errorMessage: typeof row.error_message === "string" ? row.error_message : undefined,
+  upstreamUrl: typeof row.upstream_url === "string" ? row.upstream_url : undefined,
+  upstreamStatusCode: typeof row.upstream_status_code === "number" ? row.upstream_status_code : undefined,
+  durationMs: typeof row.duration_ms === "number" ? row.duration_ms : undefined
+});
+
+const mapProxyConfigRow = (row: Record<string, unknown>): ProxyConfig => ({
+  mode: row.mode === "forward" ? "forward" : "capture_only",
+  apiType: row.api_type === "responses" ? "responses" : "chat_completions",
+  baseUrl: String(row.base_url ?? ""),
+  path: String(row.path ?? pathFromApiType(row.api_type === "responses" ? "responses" : "chat_completions")),
+  apiKey: String(row.api_key ?? ""),
+  modelOverride: String(row.model_override ?? "")
+});
+
+const mapModelRow = (row: Record<string, unknown>): ModelRecord => ({
+  id: String(row.id),
+  object: String(row.object),
+  created: Number(row.created) || Math.floor(Date.now() / 1000),
+  owned_by: String(row.owned_by)
+});
 
 const emit = (latest: ExchangeRecord | null) => {
   const state = getDashboardState();
@@ -99,11 +206,23 @@ export const addExchange = (params: {
     createdAt: new Date().toISOString(),
     responseStatus: "pending"
   };
-
-  exchanges.unshift(record);
-  if (exchanges.length > 100) {
-    exchanges.length = 100;
-  }
+  db.prepare(
+    `INSERT INTO exchanges (
+      id, mode, model, prompt, prompt_tokens, request_body, created_at, response_status
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    record.id,
+    record.mode,
+    record.model,
+    record.prompt,
+    record.promptTokens,
+    JSON.stringify(record.requestBody ?? null),
+    record.createdAt,
+    record.responseStatus
+  );
+  db.prepare(
+    "DELETE FROM exchanges WHERE id NOT IN (SELECT id FROM exchanges ORDER BY created_at DESC, id DESC LIMIT 100)"
+  ).run();
   emit(record);
   return record;
 };
@@ -119,58 +238,118 @@ export const completeExchange = (
     durationMs?: number;
   }
 ) => {
-  const target = exchanges.find((item) => item.id === id);
-  if (!target) {
+  const found = db.prepare("SELECT id FROM exchanges WHERE id = ?").get(id) as { id: string } | undefined;
+  if (!found) {
     return null;
   }
-  target.responseStatus = update.responseStatus;
-  target.responseBody = update.responseBody;
-  target.errorMessage = update.errorMessage;
-  target.upstreamUrl = update.upstreamUrl;
-  target.upstreamStatusCode = update.upstreamStatusCode;
-  target.durationMs = update.durationMs;
-  target.completedAt = new Date().toISOString();
+  const completedAt = new Date().toISOString();
+  db.prepare(
+    `UPDATE exchanges
+     SET response_status = ?, response_body = ?, error_message = ?, upstream_url = ?,
+         upstream_status_code = ?, duration_ms = ?, completed_at = ?
+     WHERE id = ?`
+  ).run(
+    update.responseStatus,
+    update.responseBody === undefined ? null : JSON.stringify(update.responseBody),
+    update.errorMessage ?? null,
+    update.upstreamUrl ?? null,
+    update.upstreamStatusCode ?? null,
+    update.durationMs ?? null,
+    completedAt,
+    id
+  );
+  const targetRow = db.prepare("SELECT * FROM exchanges WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+  if (!targetRow) {
+    return null;
+  }
+  const target = mapExchangeRow(targetRow);
   emit(target);
   return target;
 };
 
-export const getExchanges = () => exchanges;
-
-export const getExchangeStats = (): ExchangeStats => ({
-  totalRequests: exchanges.length,
-  totalPromptTokens: exchanges.reduce((sum, item) => sum + item.promptTokens, 0),
-  totalForwarded: exchanges.filter((item) => item.mode === "forward").length,
-  totalCaptureOnly: exchanges.filter((item) => item.mode === "capture_only").length
-});
-
-export const getProxyConfig = (): ProxyConfig => ({ ...proxyConfig });
-
-export const setProxyConfig = (next: Partial<ProxyConfig>) => {
-  if (next.mode) {
-    proxyConfig.mode = next.mode;
-  }
-  if (next.apiType) {
-    proxyConfig.apiType = next.apiType;
-    proxyConfig.path = pathFromApiType(next.apiType);
-  }
-  if (typeof next.baseUrl === "string") {
-    proxyConfig.baseUrl = next.baseUrl.trim();
-  }
-  if (typeof next.path === "string") {
-    proxyConfig.path = next.path.trim();
-    proxyConfig.apiType = apiTypeFromPath(proxyConfig.path);
-  }
-  if (typeof next.apiKey === "string") {
-    proxyConfig.apiKey = next.apiKey.trim();
-  }
-  if (typeof next.modelOverride === "string") {
-    proxyConfig.modelOverride = next.modelOverride.trim();
-  }
-  emit(null);
-  return getProxyConfig();
+export const getExchanges = () => {
+  const rows = db.prepare("SELECT * FROM exchanges ORDER BY created_at DESC, id DESC LIMIT 100").all() as Array<
+    Record<string, unknown>
+  >;
+  return rows.map(mapExchangeRow);
 };
 
-export const getModels = () => [...modelCatalog];
+export const getExchangeStats = (): ExchangeStats => {
+  const row = db
+    .prepare(
+      `SELECT
+        COUNT(*) AS total_requests,
+        COALESCE(SUM(prompt_tokens), 0) AS total_prompt_tokens,
+        COALESCE(SUM(CASE WHEN mode = 'forward' THEN 1 ELSE 0 END), 0) AS total_forwarded,
+        COALESCE(SUM(CASE WHEN mode = 'capture_only' THEN 1 ELSE 0 END), 0) AS total_capture_only
+      FROM exchanges`
+    )
+    .get() as Record<string, unknown>;
+
+  return {
+    totalRequests: Number(row.total_requests) || 0,
+    totalPromptTokens: Number(row.total_prompt_tokens) || 0,
+    totalForwarded: Number(row.total_forwarded) || 0,
+    totalCaptureOnly: Number(row.total_capture_only) || 0
+  };
+};
+
+export const getProxyConfig = (): ProxyConfig => {
+  const row = db.prepare("SELECT * FROM proxy_config WHERE id = 1").get() as Record<string, unknown> | undefined;
+  if (!row) {
+    return { ...proxyConfig };
+  }
+  return mapProxyConfigRow(row);
+};
+
+export const setProxyConfig = (next: Partial<ProxyConfig>) => {
+  const current = getProxyConfig();
+  const updated: ProxyConfig = { ...current };
+
+  if (next.mode) {
+    updated.mode = next.mode;
+  }
+  if (next.apiType) {
+    updated.apiType = next.apiType;
+    updated.path = pathFromApiType(next.apiType);
+  }
+  if (typeof next.baseUrl === "string") {
+    updated.baseUrl = next.baseUrl.trim();
+  }
+  if (typeof next.path === "string") {
+    updated.path = next.path.trim();
+    updated.apiType = apiTypeFromPath(updated.path);
+  }
+  if (typeof next.apiKey === "string") {
+    updated.apiKey = next.apiKey.trim();
+  }
+  if (typeof next.modelOverride === "string") {
+    updated.modelOverride = next.modelOverride.trim();
+  }
+  db.prepare(
+    `INSERT INTO proxy_config (id, mode, api_type, base_url, path, api_key, model_override)
+     VALUES (1, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       mode = excluded.mode,
+       api_type = excluded.api_type,
+       base_url = excluded.base_url,
+       path = excluded.path,
+       api_key = excluded.api_key,
+       model_override = excluded.model_override`
+  ).run(updated.mode, updated.apiType, updated.baseUrl, updated.path, updated.apiKey, updated.modelOverride);
+  emit(null);
+  return updated;
+};
+
+export const getModels = () => {
+  const rows = db.prepare("SELECT id, object, created, owned_by FROM models ORDER BY id ASC").all() as Array<
+    Record<string, unknown>
+  >;
+  if (rows.length === 0) {
+    return [...defaultModels];
+  }
+  return rows.map(mapModelRow);
+};
 
 export const setModels = (items: ModelRecord[]) => {
   const uniq = new Map<string, ModelRecord>();
@@ -187,16 +366,25 @@ export const setModels = (items: ModelRecord[]) => {
     });
   }
 
-  if (uniq.size === 0) {
-    modelCatalog = [...defaultModels];
-  } else {
-    modelCatalog = Array.from(uniq.values()).slice(0, 200);
+  const nextModels = uniq.size === 0 ? [...defaultModels] : Array.from(uniq.values()).slice(0, 200);
+  db.exec("BEGIN");
+  try {
+    db.prepare("DELETE FROM models").run();
+    const insertModel = db.prepare("INSERT INTO models (id, object, created, owned_by) VALUES (?, ?, ?, ?)");
+    for (const item of nextModels) {
+      insertModel.run(item.id, item.object, item.created, item.owned_by);
+    }
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
   }
 
-  if (proxyConfig.modelOverride && !modelCatalog.some((item) => item.id === proxyConfig.modelOverride)) {
-    proxyConfig.modelOverride = "";
+  const config = getProxyConfig();
+  if (config.modelOverride && !nextModels.some((item) => item.id === config.modelOverride)) {
+    setProxyConfig({ modelOverride: "" });
+    return getModels();
   }
-
   emit(null);
   return getModels();
 };

@@ -51,6 +51,7 @@ bun run dev
 - `UPSTREAM_PATH`
 - `UPSTREAM_API_KEY`
 - `UPSTREAM_MODEL`
+- `SQLITE_PATH`：SQLite 文件路径（默认 `data/fake-model.db`）
 
 同步上游模型后，本项目的 `/v1/models` 会返回与上游一致的模型列表。
 
