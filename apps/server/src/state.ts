@@ -1,6 +1,6 @@
 import { mkdirSync } from "node:fs";
+import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
-import { DatabaseSync } from "node:sqlite";
 
 export type ProxyMode = "capture_only" | "forward";
 export type ApiType = "chat_completions" | "responses";
@@ -80,42 +80,115 @@ const proxyConfig: ProxyConfig = {
 
 const sqlitePath = resolve(process.cwd(), process.env.SQLITE_PATH ?? "data/fake-model.db");
 mkdirSync(dirname(sqlitePath), { recursive: true });
-const db = new DatabaseSync(sqlitePath);
+type PreparedStatement = {
+  run: (...args: unknown[]) => unknown;
+  get: (...args: unknown[]) => unknown;
+  all: (...args: unknown[]) => unknown;
+};
 
-db.exec(`
-PRAGMA journal_mode = WAL;
-CREATE TABLE IF NOT EXISTS proxy_config (
-  id INTEGER PRIMARY KEY CHECK (id = 1),
-  mode TEXT NOT NULL,
-  api_type TEXT NOT NULL,
-  base_url TEXT NOT NULL,
-  path TEXT NOT NULL,
-  api_key TEXT NOT NULL,
-  model_override TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS models (
-  id TEXT PRIMARY KEY,
-  object TEXT NOT NULL,
-  created INTEGER NOT NULL,
-  owned_by TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS exchanges (
-  id TEXT PRIMARY KEY,
-  mode TEXT NOT NULL,
-  model TEXT NOT NULL,
-  prompt TEXT NOT NULL,
-  prompt_tokens INTEGER NOT NULL,
-  request_body TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  completed_at TEXT,
-  response_status TEXT NOT NULL,
-  response_body TEXT,
-  error_message TEXT,
-  upstream_url TEXT,
-  upstream_status_code INTEGER,
-  duration_ms INTEGER
-);
-`);
+type DatabaseLike = {
+  exec: (sql: string) => void;
+  prepare: (sql: string) => PreparedStatement;
+};
+
+const require = createRequire(import.meta.url);
+
+const createDatabase = (path: string): DatabaseLike => {
+  try {
+    const nodeSqlite = require("node:sqlite") as { DatabaseSync: new (dbPath: string) => DatabaseLike };
+    return new nodeSqlite.DatabaseSync(path);
+  } catch {}
+
+  try {
+    const bunSqlite = require("bun:sqlite") as { Database: new (dbPath: string) => { exec: (sql: string) => void; query: (sql: string) => PreparedStatement } };
+    const bunDb = new bunSqlite.Database(path);
+    return {
+      exec: (sql: string) => bunDb.exec(sql),
+      prepare: (sql: string) => bunDb.query(sql)
+    };
+  } catch {}
+
+  throw new Error("SQLite module not available. Use Bun (bun:sqlite) or Node with node:sqlite.");
+};
+
+const db = createDatabase(sqlitePath);
+
+type Migration = {
+  version: number;
+  up: (database: DatabaseLike) => void;
+};
+
+const migrations: Migration[] = [
+  {
+    version: 1,
+    up: (database) => {
+      database.exec(`
+      CREATE TABLE IF NOT EXISTS proxy_config (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        mode TEXT NOT NULL,
+        api_type TEXT NOT NULL,
+        base_url TEXT NOT NULL,
+        path TEXT NOT NULL,
+        api_key TEXT NOT NULL,
+        model_override TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS models (
+        id TEXT PRIMARY KEY,
+        object TEXT NOT NULL,
+        created INTEGER NOT NULL,
+        owned_by TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS exchanges (
+        id TEXT PRIMARY KEY,
+        mode TEXT NOT NULL,
+        model TEXT NOT NULL,
+        prompt TEXT NOT NULL,
+        prompt_tokens INTEGER NOT NULL,
+        request_body TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        completed_at TEXT,
+        response_status TEXT NOT NULL,
+        response_body TEXT,
+        error_message TEXT,
+        upstream_url TEXT,
+        upstream_status_code INTEGER,
+        duration_ms INTEGER
+      );
+      `);
+    }
+  }
+];
+
+const getUserVersion = () => {
+  const row = db.prepare("PRAGMA user_version").get() as Record<string, unknown> | undefined;
+  if (!row || typeof row !== "object") {
+    return 0;
+  }
+  const value = (row.user_version ?? Object.values(row)[0]) as unknown;
+  return typeof value === "number" ? value : Number(value) || 0;
+};
+
+const applyMigrations = () => {
+  db.exec("PRAGMA journal_mode = WAL");
+  let userVersion = getUserVersion();
+  for (const migration of migrations.sort((a, b) => a.version - b.version)) {
+    if (migration.version <= userVersion) {
+      continue;
+    }
+    db.exec("BEGIN");
+    try {
+      migration.up(db);
+      db.exec(`PRAGMA user_version = ${migration.version}`);
+      db.exec("COMMIT");
+      userVersion = migration.version;
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+};
+
+applyMigrations();
 
 const hasConfig = db.prepare("SELECT 1 AS ok FROM proxy_config WHERE id = 1").get() as { ok: number } | undefined;
 if (!hasConfig) {
