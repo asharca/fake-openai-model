@@ -14,12 +14,14 @@ import {
   ExternalLink,
   Hash,
   Loader2,
+  Moon,
   Radio,
   RefreshCw,
   Search,
   Send,
   Settings2,
   Shield,
+  Sun,
   X,
   Zap,
   XCircle,
@@ -613,6 +615,20 @@ export const App = () => {
   const [searchQuery, setSearchQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<"all" | "success" | "error" | "pending">("all");
 
+  /* theme */
+  const [theme, setTheme] = useState<"winter" | "business">(() => {
+    const saved = localStorage.getItem("theme");
+    if (saved === "winter" || saved === "business") return saved;
+    return window.matchMedia("(prefers-color-scheme: dark)").matches ? "business" : "winter";
+  });
+  const isDark = theme === "business";
+  const toggleTheme = useCallback(() => {
+    const next = isDark ? "winter" : "business";
+    setTheme(next);
+    document.documentElement.setAttribute("data-theme", next);
+    localStorage.setItem("theme", next);
+  }, [isDark]);
+
   const dirtyRef = useRef(false);
   const lastSavedSignatureRef = useRef(JSON.stringify(defaultConfig));
 
@@ -783,6 +799,13 @@ export const App = () => {
             <span title="Completion Tokens" className="text-success/60"><Zap size={10} className="inline" /> {totalCompletionTokens.toLocaleString()}</span>
             <span title="总 Tokens"><Coins size={10} className="inline" /> {(stats.totalPromptTokens + totalCompletionTokens).toLocaleString()}</span>
           </div>
+          <button
+            className="btn btn-ghost btn-sm btn-circle h-7 w-7 min-h-0"
+            onClick={toggleTheme}
+            title={isDark ? "切换亮色模式" : "切换暗色模式"}
+          >
+            {isDark ? <Sun size={14} /> : <Moon size={14} />}
+          </button>
           <button className="btn btn-primary btn-sm gap-1.5 h-7 min-h-0 text-xs" onClick={() => setSettingsOpen(true)}>
             <Settings2 size={13} /> 配置
           </button>

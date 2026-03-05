@@ -14,7 +14,7 @@ const config: Config = {
   },
   plugins: [typography, daisyui],
   daisyui: {
-    themes: ["business"],
+    themes: ["winter", "business"],
     darkTheme: "business"
   }
 };
